@@ -8,15 +8,16 @@ Package: `com.example.spark.etag`
 
 Expose, for every input file of Spark's built-in Parquet, ORC, CSV and JSON
 file sources, the S3 object's ETag as `_metadata.etag` and its user-defined
-object metadata as `_metadata.user_metadata` (a `map<string,string>`), without
-changing how users read data. The map is what makes rclone's source
+object metadata as `_metadata.user_metadata` (a JSON object string; Spark's
+`FileSourceMetadataAttribute.isSupportedType` forbids map-typed metadata
+fields), without changing how users read data. The map is what makes rclone's source
 modification time reachable: rclone stores it as `X-Amz-Meta-Mtime`, a
 decimal string of Unix seconds with nanosecond precision, and S3A hands it
 back under the key `mtime`. After installing the extension:
 
 ```sql
 SELECT _metadata.file_path, _metadata.etag,
-       timestamp_seconds(CAST(_metadata.user_metadata['mtime'] AS DOUBLE)) AS source_mtime,
+       timestamp_seconds(CAST(get_json_object(_metadata.user_metadata, '$.mtime') AS DOUBLE)) AS source_mtime,
        *
 FROM parquet.`s3a://bucket/prefix/`
 ```
@@ -44,14 +45,13 @@ arbitrary paths.
   one of the built-in four. A filter on `etag` or `user_metadata` therefore
   must not reach the wrapped index; `EtagFileIndex` strips such filters and
   applies them itself through `EtagFilePruner` after attaching the values.
-* Constant field values are wrapped with `Literal.apply`, which converts a
-  String but throws for a Scala `Map`; a format can override
-  `fileConstantMetadataExtractors` and return a ready `Literal` instead.
-* On the columnar scan path each constant metadata column becomes a
-  `ConstantColumnVector` filled by `ColumnVectorUtils.populate`, which
-  supports atomic types only. `FileSourceScanExec.supportsColumnar` consults
-  `fileFormat.supportBatch(session, scanSchema)` with the metadata columns
-  included, so a format can refuse batch reading when the map is selected.
+* `FileSourceMetadataAttribute.isSupportedType` admits only primitive,
+  decimal, binary, string and calendar-interval types, enforced by both
+  `FileSourceConstantMetadataStructField.apply` and `unapply`, so the user
+  metadata block is exposed as a JSON string; `get_json_object` and
+  `from_json(..., 'map<string,string>')` read keys from it in SQL, and a
+  filter built that way references only the constant string column, so it
+  still prunes files.
 * Hadoop's S3A `getXAttrs(path)` issues one HEAD request and returns every
   object header as an xattr named `header.<name>` with a UTF-8 value. User
   metadata keys are already stripped of `x-amz-meta-` by the AWS SDK, so
@@ -127,14 +127,14 @@ listed, every file path not yet cached gets one `fs.getXAttrs(path)` call,
 issued from a driver-side fixed pool of 32 threads that is created for the
 call and shut down afterwards. Each xattr named `header.<name>` that is not
 one of S3A's standard headers becomes an entry keyed by `<name>` lower-cased
-with any leading `x-amz-meta-` removed. The result, an empty map for an
-object without user metadata, is cached in a
-`ConcurrentHashMap[Path, Map[String, String]]` cleared by `refresh()`. A
-filesystem that throws `UnsupportedOperationException` from `getXAttrs`
-yields `null`; other failures propagate. Every file gets
-`"user_metadata" -> map-or-null` in its metadata map; when
-`fetchUserMetadata` is false the value is always `null` and no request is
-made.
+with any leading `x-amz-meta-` removed. The entries are serialised by
+`UserMetadataJson.encode` (Jackson, keys sorted) and cached as
+`ConcurrentHashMap[Path, Option[String]]`, `None` for an object without user
+metadata, cleared by `refresh()`. A filesystem that throws
+`UnsupportedOperationException` from `getXAttrs` yields `null`; other failures
+propagate. Every file gets `"user_metadata" -> json-or-null` in its metadata
+map; when `fetchUserMetadata` is false the value is always `null` and no
+request is made.
 
 ### `EtagFilePruner(dataFilters: Seq[Expression])`
 
@@ -143,10 +143,10 @@ Exposes `heldBackFilters`, the input filters that reference the `etag` or
 failing those filters whose references are all file-constant metadata
 attributes other than `file_block_start` and `file_block_length`. Binding and
 evaluation mirror Spark's `FilePruningRunner`, but the metadata row is built
-with `FileFormat.updateMetadataInternalRow` over a `PartitionedFile` using
-`EtagFileFormats.METADATA_EXTRACTORS`, which supports the custom fields. A
-filter such as `_metadata.user_metadata['mtime'] > '1694500000'` therefore
-prunes at planning time.
+with `FileFormat.updateMetadataInternalRow` over a `PartitionedFile`, which
+looks custom fields up by name. A filter such as
+`get_json_object(_metadata.user_metadata, '$.mtime') > '1694500000'`
+therefore prunes at planning time.
 
 ### `EtagFileFormats`
 
@@ -164,16 +164,11 @@ Each overrides `metadataSchemaFields` to append `ETAG_FIELD` then
 
 ```
 ETAG_FIELD = FileSourceConstantMetadataStructField("etag", StringType, nullable = true)
-USER_METADATA_FIELD = FileSourceConstantMetadataStructField(
-  "user_metadata", MapType(StringType, StringType, valueContainsNull = true), nullable = true)
+USER_METADATA_FIELD = FileSourceConstantMetadataStructField("user_metadata", StringType, nullable = true)
 ```
 
-and `fileConstantMetadataExtractors` to `EtagFileFormats.METADATA_EXTRACTORS`,
-Spark's base extractors plus one for `user_metadata` that returns
-`Literal.create(map, MapType)` for a non-empty map and `Literal(null, MapType)`
-otherwise. The Parquet and ORC subclasses also override `supportBatch` to
-return false when the scan schema contains the `user_metadata` map, so those
-queries take the row-based reader. Each also overrides `equals` to
+Both are strings, so Spark's default name lookup fills them and batch reading
+is unaffected. Each also overrides `equals` to
 `other.getClass == getClass` and `hashCode` to `getClass.hashCode`, because
 the built-in Parquet and ORC formats consider any subclass equal to
 themselves.
@@ -202,7 +197,7 @@ Read through `session.conf.get(key, default)` at rule time, so `SET` in SQL take
    user metadata, then applies filters on those fields.
 5. `FileSourceScanExec` builds `PartitionedFile`s carrying the map; on
    executors the default name lookup fills `_metadata.etag`.
-6. Any filter on `_metadata.etag` or `_metadata.user_metadata[...]` is applied
+6. Any filter on `_metadata.etag` or on `get_json_object(_metadata.user_metadata, ...)` is applied
    by `EtagFilePruner` during step 4, so non-matching files are never scanned.
 
 ## Error handling
@@ -263,15 +258,16 @@ Cases:
     calls, and again after `refresh()` (counted through a test filesystem
     counter).
 
-11. `_metadata.user_metadata['mtime']` equals the rclone-style mtime of each
-    file, for Parquet (vectorized reader on) and ORC.
+11. `from_json(_metadata.user_metadata, 'map<string,string>')['mtime']` equals
+    the rclone-style mtime of each file, for all four formats.
 12. A key absent from the user metadata yields `null`.
-13. An object without user metadata yields a `null` map while others do not.
-14. `WHERE _metadata.user_metadata['name'] = <one file's name>` scans one file.
+13. An object without user metadata yields `null` while others do not.
+14. `WHERE from_json(...)['name'] = <one file's name>` scans one file.
 15. `spark.sql.s3etag.userMetadata.enabled=false` leaves the field null and
     issues no `getXAttrs` call.
-16. SQL `timestamp_seconds(CAST(coalesce(user_metadata['x-mtime'],
-    user_metadata['mtime']) AS DOUBLE))` yields the file's modification second.
+16. SQL `timestamp_seconds(CAST(coalesce(get_json_object(..., '$.x-mtime'),
+    get_json_object(..., '$.mtime')) AS DOUBLE))` yields the file's
+    modification second.
 17. `EtagFileIndex` fetches user metadata once per file, again after
     `refresh()`, not at all when disabled, strips `header.` and
     `x-amz-meta-`, and excludes standard headers.
@@ -293,6 +289,7 @@ spark-s3-etag/
     EtagFileIndex.scala
     EtagFileFormats.scala
     EtagFilePruner.scala
+    UserMetadataJson.scala
   src/test/scala/com/example/spark/etag/
     EtagLocalFileSystem.scala
     EtagMetadataColumnSuite.scala
