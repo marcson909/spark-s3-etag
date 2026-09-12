@@ -29,8 +29,8 @@ class EtagFileIndex(val delegate: FileIndex, hadoopConf: Configuration) extends 
       partitionFilters: Seq[Expression],
       dataFilters: Seq[Expression]): Seq[PartitionDirectory] = {
     val pruner = new EtagFilePruner(dataFilters)
-    // The delegate would fail on filters mentioning etag (see EtagFilePruner), so hold them back.
-    val delegateFilters = dataFilters.filterNot(pruner.etagFilters.contains)
+    // The delegate would fail on filters mentioning etag or user_metadata (see EtagFilePruner), so hold them back.
+    val delegateFilters = dataFilters.filterNot(pruner.heldBackFilters.contains)
     delegate.listFiles(partitionFilters, delegateFilters).map { directory =>
       pruner.prune(directory.copy(files = directory.files.map(attachEtag)))
     }

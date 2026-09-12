@@ -21,8 +21,8 @@ class EtagFileFormatsSuite extends AnyFunSuite {
   test("every etag format appends a nullable string constant field named etag") {
     etagFormats.foreach { format =>
       val fields = format.metadataSchemaFields
-      val last = fields.last
-      assert(last.name == "etag", s"${format.getClass.getSimpleName} last field")
+      val last = fields.dropRight(1).last
+      assert(last.name == "etag", s"${format.getClass.getSimpleName} second-to-last field")
       assert(last.dataType == StringType)
       assert(last.nullable)
       assert(FileSourceConstantMetadataStructField.unapply(last).isDefined,
@@ -53,5 +53,20 @@ class EtagFileFormatsSuite extends AnyFunSuite {
     assert(new EtagParquetFileFormat != new ParquetFileFormat)
     assert(new EtagOrcFileFormat != new OrcFileFormat)
     assert((new EtagParquetFileFormat).hashCode == (new EtagParquetFileFormat).hashCode)
+  }
+
+  test("every etag format declares user_metadata as a nullable string right after etag") {
+    etagFormats.foreach { format =>
+      val fields = format.metadataSchemaFields
+      assert(fields.takeRight(2).map(_.name) == Seq("etag", "user_metadata"))
+      val userMetadata = fields.last
+      assert(userMetadata.dataType == StringType)
+      assert(userMetadata.nullable)
+      assert(FileSourceConstantMetadataStructField.unapply(userMetadata).isDefined)
+    }
+  }
+
+  test("CUSTOM_FIELD_NAMES lists exactly the fields this extension adds") {
+    assert(EtagFileFormats.CUSTOM_FIELD_NAMES == Set("etag", "user_metadata"))
   }
 }
