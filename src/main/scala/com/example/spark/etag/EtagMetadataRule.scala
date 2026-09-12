@@ -21,7 +21,8 @@ class EtagMetadataRule(session: SparkSession) extends Rule[LogicalPlan] {
   override def apply(plan: LogicalPlan): LogicalPlan =
     if (!enabled) plan
     else plan.resolveOperatorsUp {
-      case relation: LogicalRelation =>
+      // FileStreamSource builds a fresh streaming LogicalRelation per micro-batch; leave those be.
+      case relation: LogicalRelation if !relation.isStreaming =>
         relation.relation match {
           case fsRelation: HadoopFsRelation if shouldRewrite(fsRelation) => rewrite(relation, fsRelation)
           case _ => relation
@@ -34,8 +35,10 @@ class EtagMetadataRule(session: SparkSession) extends Rule[LogicalPlan] {
     raw.toLowerCase(java.util.Locale.ROOT) match {
       case "true" => true
       case "false" => false
-      case other =>
-        logWarning(s"Ignoring value '$other' of $key because it is not a boolean; using $default")
+      case _ =>
+        if (EtagMetadataRule.warnedKeys.add(key)) {
+          logWarning(s"Ignoring value '$raw' of $key because it is not a boolean; using $default")
+        }
         default
     }
   }
@@ -47,7 +50,7 @@ class EtagMetadataRule(session: SparkSession) extends Rule[LogicalPlan] {
 
   private def enabledSchemes: Set[String] =
     session.conf.get(EtagMetadataRule.SchemesKey, EtagMetadataRule.DefaultSchemes)
-      .split(",").map(_.trim.toLowerCase).filter(_.nonEmpty).toSet
+      .split(",").map(_.trim.toLowerCase(java.util.Locale.ROOT)).filter(_.nonEmpty).toSet
 
   private def shouldRewrite(fsRelation: HadoopFsRelation): Boolean = {
     val schemes = enabledSchemes
@@ -59,12 +62,17 @@ class EtagMetadataRule(session: SparkSession) extends Rule[LogicalPlan] {
   }
 
   private def schemeOf(path: Path): String =
-    Option(path.toUri.getScheme).getOrElse("").toLowerCase
+    Option(path.toUri.getScheme).getOrElse("").toLowerCase(java.util.Locale.ROOT)
 
   private def rewrite(relation: LogicalRelation, fsRelation: HadoopFsRelation): LogicalRelation = {
     val rewrittenFsRelation = fsRelation.copy(
       location = new EtagFileIndex(
-        fsRelation.location, session.sessionState.newHadoopConf(), userMetadataEnabled),
+        fsRelation.location,
+        // Per-read options such as .option("fs.s3a.endpoint", ...) reach Spark's own listing this
+        // way, so the wrapper's own filesystem calls must see them too.
+        fsRelation.sparkSession.sessionState.newHadoopConfWithOptions(fsRelation.options),
+        userMetadataEnabled,
+        session.sessionState.conf.ignoreMissingFiles),
       fileFormat = EtagFileFormats.replacementFor(fsRelation.fileFormat).get)(fsRelation.sparkSession)
 
     // If Spark already added a _metadata attribute to this relation's output, its struct type
@@ -82,4 +90,7 @@ object EtagMetadataRule {
   val SchemesKey: String = "spark.sql.s3etag.schemes"
   val UserMetadataKey: String = "spark.sql.s3etag.userMetadata.enabled"
   val DefaultSchemes: String = "s3a"
+
+  /** Keys already warned about, so a bad config value is reported once per key per JVM. */
+  private val warnedKeys = java.util.concurrent.ConcurrentHashMap.newKeySet[String]()
 }

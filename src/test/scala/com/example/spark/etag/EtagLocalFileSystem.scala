@@ -64,6 +64,8 @@ class EtagLocalFileSystem extends RawLocalFileSystem {
   override def getXAttrs(path: Path): JMap[String, Array[Byte]] = {
     EtagLocalFileSystem.getXAttrsCalls.incrementAndGet()
     val file = pathToFile(path)
+    // S3A raises FileNotFoundException for a HEAD of an object that is not there.
+    if (!file.exists()) throw new java.io.FileNotFoundException(path.toString)
     val headers = new JHashMap[String, Array[Byte]]()
     def put(name: String, value: String): Unit =
       headers.put(name, value.getBytes(StandardCharsets.UTF_8))

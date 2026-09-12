@@ -95,8 +95,12 @@ queries.
 * `etag` comes from the directory listing: one S3 LIST request per directory,
   the same order of cost as Spark's own listing.
 * `user_metadata` needs one S3 HEAD request per file, issued from the driver
-  32 at a time while the query is planned and cached for the life of the
-  plan. For a scan over many thousands of files, turn it off unless you use it.
+  32 at a time while the query is planned and cached per query plan (a new
+  query lists and fetches again). For a scan over many thousands of files,
+  turn it off unless you use it.
+* A HEAD that fails (for example an object deleted after listing) fails the
+  query, unless `spark.sql.files.ignoreMissingFiles` is true, in which case
+  that object's `user_metadata` is `NULL`.
 
 ## How it works
 
@@ -135,6 +139,11 @@ The ETag matches minus the surrounding quotes S3 prints, and the JSON shows
 * Filesystems whose file statuses do not implement `EtagSource` yield a null
   `etag`; filesystems without `getXAttrs` support yield a null `user_metadata`
   (for example plain `file://`, or vendor S3 clients).
+* A view created before the extension was installed that selects `_metadata`
+  as a whole has a narrower struct type recorded and fails to resolve;
+  recreate it.
+* A user metadata key that matches a standard header name after prefix
+  stripping (for example `content-type`) is dropped.
 * Wrapping the file index hides its concrete class from Spark's
   `PruneFileSourcePartitions` optimizer rule. Partition pruning still happens
   during listing, but optimizer statistics for partitioned catalog tables can

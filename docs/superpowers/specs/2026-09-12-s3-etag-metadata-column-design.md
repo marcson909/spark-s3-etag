@@ -281,7 +281,9 @@ upload a small file with `aws s3 cp`, compare `_metadata.etag` with
 ```
 spark-s3-etag/
   build.sbt                      scala 2.13.17; spark-sql 4.1.2 % Provided;
-                                 hadoop-aws 3.4.2 % Provided; scalatest % Test
+                                 scalatest % Test
+                                 (no hadoop-aws: only hadoop-common's EtagSource
+                                 is needed, and it comes with spark-sql)
   project/build.properties       sbt.version=1.11.0
   src/main/scala/com/example/spark/etag/
     S3EtagExtension.scala
@@ -292,8 +294,14 @@ spark-s3-etag/
     UserMetadataJson.scala
   src/test/scala/com/example/spark/etag/
     EtagLocalFileSystem.scala
+    EtagLocalFileSystemSuite.scala
+    EtagSparkSession.scala
     EtagMetadataColumnSuite.scala
+    EtagMetadataRuleSuite.scala
     EtagFileIndexSuite.scala
+    EtagFileFormatsSuite.scala
+    EtagFilePrunerSuite.scala
+    UserMetadataJsonSuite.scala
   README.md
 ```
 

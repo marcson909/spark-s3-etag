@@ -5,6 +5,7 @@ import java.nio.file.Files
 
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.execution.FileSourceScanExec
+import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.functions.{col, from_json}
 import org.apache.spark.sql.types.StructType
 import org.scalatest.funsuite.AnyFunSuite
@@ -215,6 +216,27 @@ class EtagMetadataColumnSuite extends AnyFunSuite with EtagSparkSession {
       assert(userMetadataKey(df, "mtime").values.forall(_ == null))
       assert(EtagLocalFileSystem.getXAttrsCalls.get() == before)
     }
+  }
+
+  test("per-read Hadoop options reach the wrapping file index") {
+    val dir = newDir()
+    writeFiles("parquet", dir)
+    val df = spark.read.option("fs.etagfs.marker", "from-read-option").parquet(etagfs(dir))
+    val index = df.queryExecution.analyzed.collectFirst {
+      case l: LogicalRelation =>
+        l.relation.asInstanceOf[HadoopFsRelation].location.asInstanceOf[EtagFileIndex]
+    }.get
+    assert(index.hadoopConf.get("fs.etagfs.marker") == "from-read-option")
+  }
+
+  test("a second read of the same path hits the cache of the first") {
+    val dir = newDir(); writeFiles("parquet", dir)
+    val first = spark.read.parquet(etagfs(dir)); first.cache(); first.count()
+    try {
+      val second = spark.read.parquet(etagfs(dir))
+      assert(spark.sharedState.cacheManager.lookupCachedData(
+        spark.asInstanceOf[org.apache.spark.sql.classic.SparkSession], second.queryExecution.analyzed).isDefined)
+    } finally first.unpersist()
   }
 
   test("SQL can coalesce keys and turn the mtime into a timestamp") {

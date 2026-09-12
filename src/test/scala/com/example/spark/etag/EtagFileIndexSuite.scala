@@ -173,6 +173,33 @@ class EtagFileIndexSuite extends AnyFunSuite {
     assert(result.flatMap(_.files).map(_.getPath.getName) == Seq("c.txt"))
   }
 
+  test("two wrappers over the same delegate with the same flags are equal") {
+    val f = new Fixture
+    val one = new EtagFileIndex(f.delegate, conf, fetchUserMetadata = true)
+    val two = new EtagFileIndex(f.delegate, conf, fetchUserMetadata = true)
+    assert(one == two)
+    assert(one.hashCode() == two.hashCode())
+    assert(one != new EtagFileIndex(f.delegate, conf, fetchUserMetadata = false))
+    assert(one != new EtagFileIndex(f.delegate, conf, fetchUserMetadata = true, ignoreMissingFiles = true))
+    assert(one != new EtagFileIndex(new FixedFileIndex(f.listing), conf, fetchUserMetadata = true))
+  }
+
+  test("a file that disappears after listing fails the query") {
+    val f = new Fixture
+    assert(f.b.delete())
+    val thrown = intercept[java.io.IOException](f.index.listFiles(Nil, Nil))
+    assert(thrown.getMessage.contains("b.txt"))
+  }
+
+  test("a file that disappears after listing yields null user metadata when ignoreMissingFiles") {
+    val f = new Fixture
+    val index = new EtagFileIndex(f.delegate, conf, fetchUserMetadata = true, ignoreMissingFiles = true)
+    assert(f.b.delete())
+    val userMetadata = userMetadataOf(index.listFiles(Nil, Nil))
+    assert(userMetadata("b.txt") == null)
+    assert(userMetadata("a.txt") == expectedJson(f.a))
+  }
+
   test("userMetadataKey maps S3A xattr names to user metadata keys") {
     assert(EtagFileIndex.userMetadataKey("header.mtime") == Some("mtime"))
     assert(EtagFileIndex.userMetadataKey("header.X-Amz-Meta-Mtime") == Some("mtime"))

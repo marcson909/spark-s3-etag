@@ -24,17 +24,20 @@ import org.apache.spark.sql.types.StructType
  *    file (one S3 HEAD each), fetched with a bounded thread pool. Skipped, and attached as null,
  *    when `fetchUserMetadata` is false.
  *
- * Both caches are cleared by `refresh()`. Listing and HEAD failures propagate unchanged, so a
- * broken directory fails the query the same way it would for Spark's own listing.
+ * Both caches are cleared by `refresh()`. Listing failures fail the query, the same way they
+ * would for Spark's own listing, and so do HEAD failures unless `ignoreMissingFiles` is set.
  *
  * @param delegate the index that does the real work: partition discovery, pruning, caching.
  * @param hadoopConf configuration used to obtain the FileSystem for each path.
  * @param fetchUserMetadata whether to issue the per-file requests for user metadata.
+ * @param ignoreMissingFiles whether an object that disappeared after the listing yields null
+ *                           user metadata instead of failing the query.
  */
 class EtagFileIndex(
     val delegate: FileIndex,
-    hadoopConf: Configuration,
-    fetchUserMetadata: Boolean) extends FileIndex {
+    val hadoopConf: Configuration,
+    val fetchUserMetadata: Boolean,
+    val ignoreMissingFiles: Boolean = false) extends FileIndex {
 
   private val etagsByDirectory = new ConcurrentHashMap[Path, Map[Path, String]]()
 
@@ -71,6 +74,16 @@ class EtagFileIndex(
 
   override def metadataOpsTimeNs: Option[Long] = delegate.metadataOpsTimeNs
 
+  override def equals(other: Any): Boolean = other match {
+    case that: EtagFileIndex =>
+      delegate == that.delegate && fetchUserMetadata == that.fetchUserMetadata &&
+        ignoreMissingFiles == that.ignoreMissingFiles
+    case _ => false
+  }
+
+  override def hashCode(): Int =
+    java.util.Objects.hash(delegate, Boolean.box(fetchUserMetadata), Boolean.box(ignoreMissingFiles))
+
   private def attachValues(file: FileStatusWithMetadata): FileStatusWithMetadata = {
     val path = file.getPath
     val etag = Option(path.getParent).flatMap(etagsIn(_).get(path)).orNull
@@ -86,6 +99,7 @@ class EtagFileIndex(
 
   private def listEtags(directory: Path): Map[Path, String] = {
     val fs = directory.getFileSystem(hadoopConf)
+    // A listing failure fails the query, as it would for Spark's own listing.
     fs.listStatus(directory).iterator.flatMap { status =>
       status match {
         case withEtag: EtagSource if withEtag.getEtag != null => Some(status.getPath -> withEtag.getEtag)
@@ -108,7 +122,11 @@ class EtagFileIndex(
         missing.zip(futures).foreach { case (path, future) =>
           val json =
             try future.get()
-            catch { case e: ExecutionException => throw e.getCause }
+            catch {
+              case e: ExecutionException =>
+                val cause = Option(e.getCause).getOrElse(e)
+                throw new java.io.IOException(s"Failed to read user metadata for $path", cause)
+            }
           userMetadataByPath.put(path, json)
         }
       } finally {
@@ -122,7 +140,11 @@ class EtagFileIndex(
     val fs = path.getFileSystem(hadoopConf)
     val attributes: JMap[String, Array[Byte]] =
       try fs.getXAttrs(path)
-      catch { case _: UnsupportedOperationException => null }
+      catch {
+        case _: UnsupportedOperationException => null
+        // The object went away between the listing and this HEAD.
+        case _: java.io.FileNotFoundException if ignoreMissingFiles => null
+      }
     if (attributes == null) None
     else {
       val values = attributes.asScala.iterator.flatMap { case (name, bytes) =>
