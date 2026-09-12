@@ -5,7 +5,7 @@ import java.nio.file.Files
 
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.execution.FileSourceScanExec
-import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.functions.{col, from_json}
 import org.apache.spark.sql.types.StructType
 import org.scalatest.funsuite.AnyFunSuite
 
@@ -147,5 +147,88 @@ class EtagMetadataColumnSuite extends AnyFunSuite with EtagSparkSession {
     val df = spark.read.parquet(etagfs(dir)).filter(col("value") > 40)
     assert(df.count() == 9)
     assert(df.select("id", "value", "_metadata.etag").columns.toSeq == Seq("id", "value", "etag"))
+  }
+
+  /** rclone-style mtime of every data file directly under dir, keyed by file name. */
+  private def expectedMtimes(dir: File): Map[String, String] =
+    dir.listFiles.filter(f => f.isFile && f.getName.startsWith("part-"))
+      .map(f => f.getName -> EtagLocalFileSystem.mtimeSeconds(f)).toMap
+
+  /** One key of the user metadata per file name, read the way users would: from_json then key. */
+  private def userMetadataKey(df: DataFrame, key: String): Map[String, String] = {
+    val asMap = from_json(col("_metadata.user_metadata"), "map<string,string>", Map.empty[String, String])
+    df.select(col("_metadata.file_name"), asMap(key)).distinct()
+      .collect().map(r => r.getString(0) -> r.getString(1)).toMap
+  }
+
+  Seq("parquet", "orc", "csv", "json").foreach { format =>
+    test(s"$format: _metadata.user_metadata exposes rclone's mtime under the key mtime") {
+      val dir = newDir()
+      writeFiles(format, dir)
+      val df = spark.read.format(format).load(etagfs(dir))
+      assert(userMetadataKey(df, "mtime") == expectedMtimes(dir))
+    }
+  }
+
+  test("a key that is not present in the user metadata yields null") {
+    val dir = newDir()
+    writeFiles("parquet", dir)
+    val df = spark.read.parquet(etagfs(dir))
+    val values = userMetadataKey(df, "missing")
+    assert(values.size == 3)
+    assert(values.values.forall(_ == null))
+  }
+
+  test("an object without user metadata yields null, others do not") {
+    val dir = newDir()
+    writeFiles("parquet", dir)
+    val original = dir.listFiles.filter(_.getName.startsWith("part-")).head
+    val renamed = new File(dir, "nometa-" + original.getName)
+    assert(original.renameTo(renamed))
+    val df = spark.read.parquet(etagfs(dir))
+      .select(col("_metadata.file_name").as("name"), col("_metadata.user_metadata").isNull.as("no_metadata"))
+      .distinct()
+    val byName = df.collect().map(r => r.getString(0) -> r.getBoolean(1)).toMap
+    assert(byName(renamed.getName))
+    assert(byName.filter(_._1 != renamed.getName).values.forall(_ == false))
+  }
+
+  test("a filter on a user_metadata key prunes files before the scan") {
+    val dir = newDir()
+    val expected = writeFiles("parquet", dir)
+    val name = expected.keys.head
+    val asMap = from_json(col("_metadata.user_metadata"), "map<string,string>", Map.empty[String, String])
+    val filtered = spark.read.parquet(etagfs(dir)).filter(asMap("name") === name)
+    assert(userMetadataKey(filtered, "name") == Map(name -> name))
+    val scan = filtered.queryExecution.executedPlan.collectFirst { case s: FileSourceScanExec => s }.get
+    filtered.collect()
+    assert(scan.driverMetrics("numFiles").value == 1)
+  }
+
+  test("spark.sql.s3etag.userMetadata.enabled=false skips the per-file requests") {
+    val dir = newDir()
+    writeFiles("parquet", dir)
+    withConf(EtagMetadataRule.UserMetadataKey, "false") {
+      val before = EtagLocalFileSystem.getXAttrsCalls.get()
+      val df = spark.read.parquet(etagfs(dir))
+      assert(metadataFieldNames(df).contains("user_metadata"))
+      assert(userMetadataKey(df, "mtime").values.forall(_ == null))
+      assert(EtagLocalFileSystem.getXAttrsCalls.get() == before)
+    }
+  }
+
+  test("SQL can coalesce keys and turn the mtime into a timestamp") {
+    val dir = newDir()
+    writeFiles("parquet", dir)
+    val rows = spark.sql(
+      s"""SELECT _metadata.file_name AS file_name,
+         |       CAST(timestamp_seconds(CAST(coalesce(
+         |         get_json_object(_metadata.user_metadata, '$$.x-mtime'),
+         |         get_json_object(_metadata.user_metadata, '$$.mtime')) AS DOUBLE)) AS BIGINT)
+         |         AS modified_seconds
+         |FROM parquet.`${etagfs(dir)}`""".stripMargin).distinct().collect()
+    val actual = rows.map(r => r.getString(0) -> r.getLong(1)).toMap
+    val expected = expectedMtimes(dir).map { case (name, mtime) => name -> mtime.takeWhile(_ != '.').toLong }
+    assert(actual == expected)
   }
 }

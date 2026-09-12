@@ -2,8 +2,11 @@ package com.example.spark.etag
 
 import java.io.File
 import java.net.URI
+import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.security.MessageDigest
+import java.time.Instant
+import java.util.{HashMap => JHashMap, Map => JMap}
 import java.util.concurrent.atomic.AtomicInteger
 
 import org.apache.hadoop.fs.{EtagSource, FileStatus, Path, RawLocalFileSystem}
@@ -53,6 +56,26 @@ class EtagLocalFileSystem extends RawLocalFileSystem {
     super.listStatus(path).map(withEtag)
   }
 
+  /**
+   * Mimics S3A's getXAttrs: every header as "header.<name>". Files carry rclone-style user
+   * metadata `mtime` plus a `name` key that keeps the raw `x-amz-meta-` prefix, except files
+   * whose name starts with "nometa", which carry standard headers only.
+   */
+  override def getXAttrs(path: Path): JMap[String, Array[Byte]] = {
+    EtagLocalFileSystem.getXAttrsCalls.incrementAndGet()
+    val file = pathToFile(path)
+    val headers = new JHashMap[String, Array[Byte]]()
+    def put(name: String, value: String): Unit =
+      headers.put(name, value.getBytes(StandardCharsets.UTF_8))
+    put("header.Content-Length", file.length.toString)
+    put("header.ETag", EtagLocalFileSystem.md5Hex(file))
+    if (file.isFile && !file.getName.startsWith("nometa")) {
+      put("header.mtime", EtagLocalFileSystem.mtimeSeconds(file))
+      put("header.x-amz-meta-name", file.getName)
+    }
+    headers
+  }
+
   private def withEtag(status: FileStatus): FileStatus =
     if (status.isDirectory) status
     else new EtagFileStatus(status, EtagLocalFileSystem.md5Hex(pathToFile(status.getPath)))
@@ -64,6 +87,15 @@ object EtagLocalFileSystem {
 
   /** Total number of listStatus calls across all instances, for cache tests. */
   val listStatusCalls: AtomicInteger = new AtomicInteger(0)
+
+  /** Total number of getXAttrs calls across all instances, for cache tests. */
+  val getXAttrsCalls: AtomicInteger = new AtomicInteger(0)
+
+  /** The file's modification time the way rclone stores it: Unix seconds with nine decimals. */
+  def mtimeSeconds(file: File): String = {
+    val instant: Instant = Files.getLastModifiedTime(file.toPath).toInstant
+    f"${instant.getEpochSecond}%d.${instant.getNano}%09d"
+  }
 
   def md5Hex(file: File): String = md5Hex(Files.readAllBytes(file.toPath))
 

@@ -13,7 +13,8 @@ import org.apache.spark.sql.execution.datasources.{HadoopFsRelation, LogicalRela
  * Injected as a resolution rule, it runs in the same analyzer iteration that turns a path or
  * table into a LogicalRelation and before `_metadata` references are resolved against it. A
  * relation is rewritten when its format is one of Spark's built-in Parquet/ORC/CSV/JSON formats
- * and every root path uses a scheme listed in `spark.sql.s3etag.schemes`.
+ * and every root path uses a scheme listed in `spark.sql.s3etag.schemes`;
+ * `spark.sql.s3etag.userMetadata.enabled` decides whether the per-file user metadata is fetched.
  */
 class EtagMetadataRule(session: SparkSession) extends Rule[LogicalPlan] {
 
@@ -41,6 +42,9 @@ class EtagMetadataRule(session: SparkSession) extends Rule[LogicalPlan] {
 
   private def enabled: Boolean = booleanConf(EtagMetadataRule.EnabledKey, default = true)
 
+  private def userMetadataEnabled: Boolean =
+    booleanConf(EtagMetadataRule.UserMetadataKey, default = true)
+
   private def enabledSchemes: Set[String] =
     session.conf.get(EtagMetadataRule.SchemesKey, EtagMetadataRule.DefaultSchemes)
       .split(",").map(_.trim.toLowerCase).filter(_.nonEmpty).toSet
@@ -59,7 +63,8 @@ class EtagMetadataRule(session: SparkSession) extends Rule[LogicalPlan] {
 
   private def rewrite(relation: LogicalRelation, fsRelation: HadoopFsRelation): LogicalRelation = {
     val rewrittenFsRelation = fsRelation.copy(
-      location = new EtagFileIndex(fsRelation.location, session.sessionState.newHadoopConf()),
+      location = new EtagFileIndex(
+        fsRelation.location, session.sessionState.newHadoopConf(), userMetadataEnabled),
       fileFormat = EtagFileFormats.replacementFor(fsRelation.fileFormat).get)(fsRelation.sparkSession)
 
     // If Spark already added a _metadata attribute to this relation's output, its struct type
@@ -75,5 +80,6 @@ class EtagMetadataRule(session: SparkSession) extends Rule[LogicalPlan] {
 object EtagMetadataRule {
   val EnabledKey: String = "spark.sql.s3etag.enabled"
   val SchemesKey: String = "spark.sql.s3etag.schemes"
+  val UserMetadataKey: String = "spark.sql.s3etag.userMetadata.enabled"
   val DefaultSchemes: String = "s3a"
 }
