@@ -77,7 +77,7 @@ struct type includes `etag`. Tags are copied from the old relation.
 ### `EtagFileIndex(delegate: FileIndex) extends FileIndex`
 
 Delegates `rootPaths`, `inputFiles`, `sizeInBytes`, `partitionSchema`,
-`metadataOpsTimeNs`, `partitionSpec` (if present on the delegate) and
+`metadataOpsTimeNs` and
 `refresh` (also clears the cache).
 
 `listFiles(partitionFilters, dataFilters)` calls the delegate, then for each
@@ -154,6 +154,15 @@ Read through `session.conf.get(key, default)` at rule time, so `SET` in SQL take
 * The rule never throws; a relation that fails any precondition is returned
   unchanged.
 
+## Known limitation
+
+Wrapping hides the concrete index class. The optimizer rule
+`PruneFileSourcePartitions` only matches a bare `CatalogFileIndex`, so for
+partitioned catalog tables it no longer rewrites the relation to a pruned
+index. Partition pruning still happens, because `FileSourceStrategy` passes
+partition filters into `listFiles` and `CatalogFileIndex.listFiles` prunes
+there; only optimizer statistics for such tables may be less precise.
+
 ## Testing
 
 Unit tests with ScalaTest against a local `SparkSession` (master
@@ -198,7 +207,7 @@ upload a small file with `aws s3 cp`, compare `_metadata.etag` with
 spark-s3-etag/
   build.sbt                      scala 2.13.17; spark-sql 4.1.2 % Provided;
                                  hadoop-aws 3.4.2 % Provided; scalatest % Test
-  project/build.properties       sbt.version=1.11.x
+  project/build.properties       sbt.version=1.11.0
   src/main/scala/com/example/spark/etag/
     S3EtagExtension.scala
     EtagMetadataRule.scala
