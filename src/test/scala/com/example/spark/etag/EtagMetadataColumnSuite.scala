@@ -34,6 +34,22 @@ class EtagMetadataColumnSuite extends AnyFunSuite with EtagSparkSession {
     df.select(col("_metadata.file_name"), col("_metadata.etag")).distinct()
       .collect().map(r => r.getString(0) -> r.getString(1)).toMap
 
+  /** MD5 of every data file under dir, recursively, keyed by "<parent dir name>/<file name>". */
+  private def expectedEtagsByParent(dir: File): Map[String, String] = {
+    val (dirs, files) = dir.listFiles.toSeq.partition(_.isDirectory)
+    files.filter(_.getName.startsWith("part-"))
+      .map(f => s"${f.getParentFile.getName}/${f.getName}" -> EtagLocalFileSystem.md5Hex(f)).toMap ++
+      dirs.flatMap(expectedEtagsByParent)
+  }
+
+  /** Etags keyed by "<parent dir name>/<file name>" taken from _metadata.file_path. */
+  private def actualEtagsByParent(df: DataFrame): Map[String, String] =
+    df.select(col("_metadata.file_path"), col("_metadata.etag")).distinct()
+      .collect().map { r =>
+        val path = new org.apache.hadoop.fs.Path(r.getString(0))
+        s"${path.getParent.getName}/${path.getName}" -> r.getString(1)
+      }.toMap
+
   private def metadataFieldNames(df: DataFrame): Seq[String] =
     df.select("_metadata").schema.head.dataType.asInstanceOf[StructType].fieldNames.toSeq
 
@@ -79,15 +95,15 @@ class EtagMetadataColumnSuite extends AnyFunSuite with EtagSparkSession {
     val dir = newDir()
     spark.range(0, 30).withColumn("p", col("id") % 2).repartition(2)
       .write.partitionBy("p").parquet(dir.getAbsolutePath)
-    val expected = expectedEtags(dir)
+    val expected = expectedEtagsByParent(dir)
     assert(expected.nonEmpty)
     val df = spark.read.parquet(etagfs(dir))
-    assert(actualEtags(df) == expected)
+    assert(actualEtagsByParent(df) == expected)
     val onePartition = df.filter(col("p") === 1)
     // Partition discovery infers the directory value p=1 as an int, not the written long.
     assert(onePartition.select("p").distinct().collect().map(_.getInt(0)).toSeq == Seq(1))
-    val partitionFiles = expectedEtags(new File(dir, "p=1"))
-    assert(actualEtags(onePartition) == partitionFiles)
+    val partitionFiles = expectedEtagsByParent(new File(dir, "p=1"))
+    assert(actualEtagsByParent(onePartition) == partitionFiles)
   }
 
   test("a path on a scheme that is not enabled keeps the default _metadata shape") {
