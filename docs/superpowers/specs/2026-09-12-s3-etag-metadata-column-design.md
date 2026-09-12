@@ -80,6 +80,7 @@ Named in `spark.sql.extensions`.
 ### `EtagMetadataRule(session) extends Rule[LogicalPlan]`
 
 `apply` returns the plan unchanged when `spark.sql.s3etag.enabled` is false.
+Streaming relations (`LogicalRelation.isStreaming`) are never rewritten.
 Otherwise it uses `plan.resolveOperatorsUp` to rewrite each
 `LogicalRelation(hfs: HadoopFsRelation, ...)` for which all of the following
 hold:
@@ -98,7 +99,7 @@ attribute (matched with `FileSourceMetadataAttribute`), that attribute is
 removed and `withMetadataColumns()` is called on the new relation so the
 struct type includes `etag`. Tags are copied from the old relation.
 
-### `EtagFileIndex(delegate: FileIndex, hadoopConf: Configuration, fetchUserMetadata: Boolean) extends FileIndex`
+### `EtagFileIndex(delegate: FileIndex, hadoopConf: Configuration, fetchUserMetadata: Boolean, ignoreMissingFiles: Boolean = false) extends FileIndex`
 
 Delegates `rootPaths`, `inputFiles`, `sizeInBytes`, `partitionSchema`,
 `metadataOpsTimeNs` and
@@ -111,7 +112,8 @@ Delegates `rootPaths`, `inputFiles`, `sizeInBytes`, `partitionSchema`,
 ETag lookup: files are grouped by `getPath.getParent`. For each parent, once per
 index instance, the filesystem for that path (obtained with
 `path.getFileSystem(hadoopConf)`, where `hadoopConf` is the session's
-`sessionState.newHadoopConf()` captured at construction) is asked for
+`sessionState.newHadoopConfWithOptions(relation.options)` captured at
+construction, so per-read options such as an S3A endpoint apply) is asked for
 `listStatus(parent)`. Each returned status that implements `EtagSource` with a
 non-null etag contributes `status.getPath -> etag` to the per-directory map.
 The per-directory maps are held in a `ConcurrentHashMap[Path, Map[Path,
@@ -206,7 +208,9 @@ Read through `session.conf.get(key, default)` at rule time, so `SET` in SQL take
   listing.
 * Missing etag is `null`, never an exception; so is user metadata on a
   filesystem without xattr support.
-* HEAD request failures other than `UnsupportedOperationException` propagate.
+* HEAD request failures other than `UnsupportedOperationException` propagate,
+  wrapped in an `IOException` naming the path; a `FileNotFoundException` yields
+  `null` instead when `spark.sql.files.ignoreMissingFiles` is true.
 * The rule never throws; a relation that fails any precondition is returned
   unchanged.
 
