@@ -132,6 +132,15 @@ class EtagMetadataColumnSuite extends AnyFunSuite with EtagSparkSession {
     }
   }
 
+  test("a non-boolean value of spark.sql.s3etag.enabled is ignored and the rewrite stays on") {
+    val dir = newDir()
+    writeFiles("parquet", dir)
+    withConf(EtagMetadataRule.EnabledKey, "yes") {
+      val df = spark.read.parquet(etagfs(dir))
+      assert(metadataFieldNames(df).contains("etag"))
+    }
+  }
+
   test("the rewritten relation keeps data columns and ordinary filters working") {
     val dir = newDir()
     writeFiles("parquet", dir)

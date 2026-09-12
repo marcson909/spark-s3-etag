@@ -27,8 +27,19 @@ class EtagMetadataRule(session: SparkSession) extends Rule[LogicalPlan] {
         }
     }
 
-  private def enabled: Boolean =
-    session.conf.get(EtagMetadataRule.EnabledKey, "true").trim.toBoolean
+  /** A boolean session config; a value that is not a boolean logs a warning and means the default. */
+  private def booleanConf(key: String, default: Boolean): Boolean = {
+    val raw = session.conf.get(key, default.toString).trim
+    raw.toLowerCase(java.util.Locale.ROOT) match {
+      case "true" => true
+      case "false" => false
+      case other =>
+        logWarning(s"Ignoring value '$other' of $key because it is not a boolean; using $default")
+        default
+    }
+  }
+
+  private def enabled: Boolean = booleanConf(EtagMetadataRule.EnabledKey, default = true)
 
   private def enabledSchemes: Set[String] =
     session.conf.get(EtagMetadataRule.SchemesKey, EtagMetadataRule.DefaultSchemes)
