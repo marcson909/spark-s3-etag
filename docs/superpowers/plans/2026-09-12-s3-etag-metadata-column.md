@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A Spark 4.1 extension jar that makes `_metadata.etag` available on every Parquet, ORC, CSV and JSON read from S3A paths.
+**Goal:** A Spark 4.1 extension jar that makes `_metadata.etag` and `_metadata.user_metadata` (S3 user-defined object metadata, e.g. rclone's `mtime`) available on every Parquet, ORC, CSV and JSON read from S3A paths.
 
 **Architecture:** A `SparkSessionExtensions` resolution rule rewrites each file relation on an enabled URI scheme: the `FileIndex` is wrapped so listing attaches each file's ETag (one Hadoop `listStatus` per directory, cached), and the `FileFormat` is swapped for a subclass that adds an `etag` field to the `_metadata` struct. Because Spark's built-in file pruner asserts on unknown metadata fields, the wrapper keeps `etag` filters away from the inner index and applies them itself.
 
@@ -14,7 +14,8 @@
 - Package for all production and test classes: `com.example.spark.etag`.
 - The only runtime dependency is Spark itself. `spark-sql` is `Provided`; the jar produced by `sbt package` must contain only this project's classes (no shading, no assembly).
 - Metadata field name is exactly `etag`, type string, nullable.
-- Config keys: `spark.sql.s3etag.enabled` (default `true`) and `spark.sql.s3etag.schemes` (default `s3a`).
+- Config keys: `spark.sql.s3etag.enabled` (default `true`), `spark.sql.s3etag.schemes` (default `s3a`), `spark.sql.s3etag.userMetadata.enabled` (default `true`).
+- Second metadata field name is exactly `user_metadata`, type `map<string,string>`, nullable; keys are the S3 user metadata keys without the `x-amz-meta-` prefix (rclone's mtime is under `mtime`).
 - Tests must run offline. The `etagfs` test filesystem stands in for S3A.
 - Every test class extends `org.scalatest.funsuite.AnyFunSuite`.
 - Commit after every task with the attribution trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
@@ -25,9 +26,9 @@
 | Path | Responsibility |
 |---|---|
 | `build.sbt`, `project/build.properties`, `.gitignore` | Build definition. |
-| `src/main/scala/com/example/spark/etag/EtagFileFormats.scala` | The `etag` struct field, the four format subclasses, and `replacementFor`. |
-| `src/main/scala/com/example/spark/etag/EtagFilePruner.scala` | Applies filters that mention `etag` to a listed directory. |
-| `src/main/scala/com/example/spark/etag/EtagFileIndex.scala` | Wraps a `FileIndex`; attaches etags; caches per directory; prunes. |
+| `src/main/scala/com/example/spark/etag/EtagFileFormats.scala` | The `etag` and `user_metadata` struct fields, their extractors, the four format subclasses, and `replacementFor`. |
+| `src/main/scala/com/example/spark/etag/EtagFilePruner.scala` | Applies filters that mention `etag` or `user_metadata` to a listed directory. |
+| `src/main/scala/com/example/spark/etag/EtagFileIndex.scala` | Wraps a `FileIndex`; attaches etags (per directory) and user metadata (per file, bounded parallelism); caches; prunes. |
 | `src/main/scala/com/example/spark/etag/EtagMetadataRule.scala` | Analyzer rule that rewrites eligible relations. |
 | `src/main/scala/com/example/spark/etag/S3EtagExtension.scala` | Entry point named in `spark.sql.extensions`. |
 | `src/test/scala/com/example/spark/etag/EtagLocalFileSystem.scala` | Test filesystem (`etagfs://`) whose statuses carry MD5 etags. |
@@ -1212,11 +1213,818 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ---
 
-### Task 6: README, packaged jar, spec sync
+### Task 6: `user_metadata` field, extractor, and pruner support
+
+**Files:**
+- Modify: `src/main/scala/com/example/spark/etag/EtagFileFormats.scala` (replace whole file)
+- Modify: `src/main/scala/com/example/spark/etag/EtagFilePruner.scala` (replace whole file)
+- Modify: `src/main/scala/com/example/spark/etag/EtagFileIndex.scala` (rename one field use)
+- Test: `src/test/scala/com/example/spark/etag/EtagFileFormatsSuite.scala` (add tests)
+- Test: `src/test/scala/com/example/spark/etag/EtagFilePrunerSuite.scala` (add tests, rename one field use)
+- Test: `src/test/scala/com/example/spark/etag/EtagFileIndexSuite.scala` (rename one field use)
+
+**Interfaces:**
+- Consumes: Task 1 formats, Task 3 pruner, Task 4 index.
+- Produces:
+  - `EtagFileFormats.USER_METADATA_FIELD_NAME: String = "user_metadata"`, `EtagFileFormats.USER_METADATA_TYPE: MapType`, `EtagFileFormats.USER_METADATA_FIELD: StructField`, `EtagFileFormats.CUSTOM_FIELD_NAMES: Set[String]`, `EtagFileFormats.METADATA_EXTRACTORS: Map[String, PartitionedFile => Any]`.
+  - The four formats now declare `etag` then `user_metadata` and override `fileConstantMetadataExtractors`; Parquet and ORC override `supportBatch` to refuse batch reading when `user_metadata` is in the scan schema.
+  - `EtagFilePruner.heldBackFilters` replaces `etagFilters` and covers both custom fields. Task 7 attaches `"user_metadata" -> Map[String, String] or null` to each file's metadata map; the extractor converts it to a catalyst map literal, and an empty or missing map becomes null.
+
+Why the extractor is needed (verified against branch-4.1 `literals.scala`): `Literal.apply(v: Any)` converts strings, numbers, arrays and so on, and passes a `Literal` through unchanged, but it throws for a Scala `Map`. Spark fills constant metadata fields by calling `Literal(extractor(file))`, so the `user_metadata` extractor must return a ready `Literal` built with `Literal.create(map, MapType(...))`.
+
+Why `supportBatch` is overridden (verified against branch-4.1 `FileScanRDD.scala` and `ColumnVectorUtils.java`): on the columnar path Spark appends each constant metadata column as a `ConstantColumnVector` populated through `ColumnVectorUtils.populate`, which supports only atomic types and throws `DataType map<string,string> is not supported` for a map. `FileSourceScanExec.supportsColumnar` asks `fileFormat.supportBatch(session, schema)` with the scan schema that includes the metadata columns, so returning false when the map is present makes Spark use the row path, where `updateMetadataInternalRow` handles a `MapData` value. Only queries that select `user_metadata` lose vectorization.
+
+- [ ] **Step 1: Add failing format tests**
+
+Append inside `class EtagFileFormatsSuite` in `src/test/scala/com/example/spark/etag/EtagFileFormatsSuite.scala` (add the imports at the top of the file):
+
+```scala
+import org.apache.spark.paths.SparkPath
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.Literal
+import org.apache.spark.sql.catalyst.util.MapData
+import org.apache.spark.sql.execution.datasources.PartitionedFile
+import org.apache.spark.sql.types.{MapType, StructField, StructType}
+```
+
+```scala
+  private def partitionedFile(metadata: Map[String, Any]): PartitionedFile =
+    PartitionedFile(
+      partitionValues = InternalRow.empty,
+      filePath = SparkPath.fromPathString("etagfs:///data/a.parquet"),
+      start = 0L,
+      length = 10L,
+      locations = Array.empty,
+      modificationTime = 0L,
+      fileSize = 10L,
+      otherConstantMetadataColumnValues = metadata)
+
+  private val userMetadataExtractor =
+    EtagFileFormats.METADATA_EXTRACTORS(EtagFileFormats.USER_METADATA_FIELD_NAME)
+
+  test("every etag format declares user_metadata as a nullable string map right after etag") {
+    etagFormats.foreach { format =>
+      val fields = format.metadataSchemaFields
+      assert(fields.takeRight(2).map(_.name) == Seq("etag", "user_metadata"))
+      val userMetadata = fields.last
+      assert(userMetadata.dataType == MapType(StringType, StringType, valueContainsNull = true))
+      assert(userMetadata.nullable)
+      assert(FileSourceConstantMetadataStructField.unapply(userMetadata).isDefined)
+      assert(format.fileConstantMetadataExtractors.contains("user_metadata"))
+    }
+  }
+
+  test("the user_metadata extractor turns the file's Scala map into a map literal") {
+    val literal = userMetadataExtractor(partitionedFile(
+      Map("user_metadata" -> Map("mtime" -> "1694500000.123456789", "name" -> "a.parquet"))))
+      .asInstanceOf[Literal]
+    assert(literal.dataType == EtagFileFormats.USER_METADATA_TYPE)
+    val map = literal.value.asInstanceOf[MapData]
+    assert(map.numElements() == 2)
+    val keys = (0 until 2).map(i => map.keyArray().getUTF8String(i).toString)
+    val values = (0 until 2).map(i => map.valueArray().getUTF8String(i).toString)
+    assert(keys.zip(values).toMap == Map("mtime" -> "1694500000.123456789", "name" -> "a.parquet"))
+  }
+
+  test("the user_metadata extractor yields a null map literal for an empty, null or missing map") {
+    Seq(Map("user_metadata" -> Map.empty[String, String]), Map("user_metadata" -> null), Map.empty[String, Any])
+      .foreach { metadata =>
+        val literal = userMetadataExtractor(partitionedFile(metadata)).asInstanceOf[Literal]
+        assert(literal.value == null)
+        assert(literal.dataType == EtagFileFormats.USER_METADATA_TYPE)
+      }
+  }
+
+  test("batch reading is refused only when the user_metadata map is part of the scan schema") {
+    val withMap = StructType(Seq(
+      StructField("id", org.apache.spark.sql.types.LongType),
+      StructField("user_metadata", EtagFileFormats.USER_METADATA_TYPE)))
+    val withoutMap = StructType(Seq(
+      StructField("id", org.apache.spark.sql.types.LongType),
+      StructField("etag", StringType)))
+    assert(!EtagFileFormats.batchReadAllowed(withMap))
+    assert(EtagFileFormats.batchReadAllowed(withoutMap))
+  }
+```
+
+- [ ] **Step 2: Add failing pruner tests**
+
+Append inside `class EtagFilePrunerSuite` in `src/test/scala/com/example/spark/etag/EtagFilePrunerSuite.scala` (add `GetMapValue` to the existing expressions import), and rename every use of `pruner.etagFilters` in the existing tests to `pruner.heldBackFilters`:
+
+```scala
+  private val userMetadata = metadataAttribute(EtagFileFormats.USER_METADATA_FIELD)
+
+  /** Files named by their user metadata "name" key; None means the object has no user metadata. */
+  private def directoryWithUserMetadata(files: (String, Option[Map[String, String]])*): PartitionDirectory =
+    PartitionDirectory(InternalRow.empty, files.map { case (name, userValues) =>
+      val status = new FileStatus(10L, false, 1, 10L, 0L, new Path("etagfs:///data/" + name))
+      FileStatusWithMetadata(status, Map(
+        EtagFileFormats.ETAG_FIELD_NAME -> ("etag-" + name),
+        EtagFileFormats.USER_METADATA_FIELD_NAME -> userValues.orNull))
+    })
+
+  private val threeFilesWithUserMetadata = directoryWithUserMetadata(
+    "a" -> Some(Map("name" -> "a", "mtime" -> "1.000000000")),
+    "b" -> Some(Map("name" -> "b", "mtime" -> "2.000000000")),
+    "c" -> None)
+
+  test("a filter on a user_metadata key is held back and prunes files") {
+    val filter = EqualTo(GetMapValue(userMetadata, Literal("name")), Literal("b"))
+    val pruner = new EtagFilePruner(Seq(filter))
+    assert(pruner.heldBackFilters == Seq(filter))
+    assert(names(pruner.prune(threeFilesWithUserMetadata)) == Seq("b"))
+  }
+
+  test("a file without user metadata never matches a user_metadata filter") {
+    val filter = EqualTo(GetMapValue(userMetadata, Literal("name")), Literal("c"))
+    assert(names(new EtagFilePruner(Seq(filter)).prune(threeFilesWithUserMetadata)).isEmpty)
+  }
+
+  test("string comparison on a user_metadata key prunes like any other constant column") {
+    val filter = GreaterThan(GetMapValue(userMetadata, Literal("mtime")), Literal("1.500000000"))
+    assert(names(new EtagFilePruner(Seq(filter)).prune(threeFilesWithUserMetadata)) == Seq("b"))
+  }
+```
+
+- [ ] **Step 3: Rename the index's use of the pruner field**
+
+In `src/main/scala/com/example/spark/etag/EtagFileIndex.scala`, change `pruner.etagFilters.contains` to `pruner.heldBackFilters.contains` and update the comment above it to: `// The delegate would fail on filters mentioning etag or user_metadata (see EtagFilePruner), so hold them back.`
+
+- [ ] **Step 4: Run the tests to verify they fail**
+
+Run:
+```bash
+sbt "testOnly com.example.spark.etag.EtagFileFormatsSuite com.example.spark.etag.EtagFilePrunerSuite"
+```
+Expected: compilation errors, `value USER_METADATA_FIELD_NAME is not a member of object EtagFileFormats` and `value heldBackFilters is not a member of EtagFilePruner`.
+
+- [ ] **Step 5: Replace `EtagFileFormats.scala`**
+
+`src/main/scala/com/example/spark/etag/EtagFileFormats.scala`:
+```scala
+package com.example.spark.etag
+
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.expressions.{FileSourceConstantMetadataStructField, Literal}
+import org.apache.spark.sql.execution.datasources.{FileFormat, PartitionedFile}
+import org.apache.spark.sql.execution.datasources.csv.CSVFileFormat
+import org.apache.spark.sql.execution.datasources.json.JsonFileFormat
+import org.apache.spark.sql.execution.datasources.orc.OrcFileFormat
+import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
+import org.apache.spark.sql.types.{MapType, StringType, StructField, StructType}
+
+/**
+ * The `_metadata.etag` and `_metadata.user_metadata` fields and the file formats that expose them.
+ *
+ * Spark builds the `_metadata` struct from `FileFormat.metadataSchemaFields`. A "constant" field
+ * is filled per file from the metadata map that the FileIndex attached to the file (see
+ * EtagFileIndex): by default Spark looks the field name up in that map and wraps the value with
+ * `Literal.apply`, which handles a String (`etag`) but not a Scala Map, so `user_metadata` has
+ * its own extractor that builds the map literal.
+ */
+object EtagFileFormats {
+  val ETAG_FIELD_NAME: String = "etag"
+  val USER_METADATA_FIELD_NAME: String = "user_metadata"
+
+  val USER_METADATA_TYPE: MapType = MapType(StringType, StringType, valueContainsNull = true)
+
+  /** Nullable because not every filesystem, and not every S3 object listing, provides an ETag. */
+  val ETAG_FIELD: StructField =
+    FileSourceConstantMetadataStructField(ETAG_FIELD_NAME, StringType, nullable = true)
+
+  /** S3 user-defined object metadata, keys without the `x-amz-meta-` prefix; null when there is none. */
+  val USER_METADATA_FIELD: StructField =
+    FileSourceConstantMetadataStructField(USER_METADATA_FIELD_NAME, USER_METADATA_TYPE, nullable = true)
+
+  /** Fields this extension adds. Filters on them must not reach Spark's own file pruner. */
+  val CUSTOM_FIELD_NAMES: Set[String] = Set(ETAG_FIELD_NAME, USER_METADATA_FIELD_NAME)
+
+  /** Extractors for every constant metadata field of the formats below. */
+  val METADATA_EXTRACTORS: Map[String, PartitionedFile => Any] =
+    FileFormat.BASE_METADATA_EXTRACTORS + (USER_METADATA_FIELD_NAME -> userMetadataLiteral _)
+
+  private def userMetadataLiteral(file: PartitionedFile): Literal =
+    file.otherConstantMetadataColumnValues.get(USER_METADATA_FIELD_NAME) match {
+      case Some(values: Map[_, _]) if values.nonEmpty => Literal.create(values, USER_METADATA_TYPE)
+      case _ => Literal(null, USER_METADATA_TYPE)
+    }
+
+  /**
+   * The etag-aware replacement for one of Spark's built-in file formats, or None when the format
+   * is anything else. Matches on the exact class so that other subclasses, including the ones
+   * defined here, are left alone.
+   */
+  def replacementFor(format: FileFormat): Option[FileFormat] = {
+    val formatClass = format.getClass
+    if (formatClass == classOf[ParquetFileFormat]) Some(new EtagParquetFileFormat)
+    else if (formatClass == classOf[OrcFileFormat]) Some(new EtagOrcFileFormat)
+    else if (formatClass == classOf[CSVFileFormat]) Some(new EtagCsvFileFormat)
+    else if (formatClass == classOf[JsonFileFormat]) Some(new EtagJsonFileFormat)
+    else None
+  }
+
+  private[etag] def withCustomFields(fields: Seq[StructField]): Seq[StructField] =
+    fields :+ ETAG_FIELD :+ USER_METADATA_FIELD
+
+  /**
+   * Spark's columnar scan appends constant metadata columns as ConstantColumnVectors, which
+   * cannot hold a map. So batch reading is allowed only while `user_metadata` is not read.
+   */
+  private[etag] def batchReadAllowed(scanSchema: StructType): Boolean =
+    !scanSchema.exists(f => f.name == USER_METADATA_FIELD_NAME && f.dataType == USER_METADATA_TYPE)
+}
+
+// Each subclass overrides equals/hashCode to compare by exact class. The built-in Parquet and
+// ORC formats treat any subclass as equal to themselves, which would let Spark's plan cache
+// mistake a rewritten relation for the original.
+
+class EtagParquetFileFormat extends ParquetFileFormat {
+  override def metadataSchemaFields: Seq[StructField] =
+    EtagFileFormats.withCustomFields(super.metadataSchemaFields)
+  override def fileConstantMetadataExtractors: Map[String, PartitionedFile => Any] =
+    EtagFileFormats.METADATA_EXTRACTORS
+  override def supportBatch(sparkSession: SparkSession, schema: StructType): Boolean =
+    EtagFileFormats.batchReadAllowed(schema) && super.supportBatch(sparkSession, schema)
+  override def equals(other: Any): Boolean = other != null && other.getClass == getClass
+  override def hashCode(): Int = getClass.hashCode()
+}
+
+class EtagOrcFileFormat extends OrcFileFormat {
+  override def metadataSchemaFields: Seq[StructField] =
+    EtagFileFormats.withCustomFields(super.metadataSchemaFields)
+  override def fileConstantMetadataExtractors: Map[String, PartitionedFile => Any] =
+    EtagFileFormats.METADATA_EXTRACTORS
+  override def supportBatch(sparkSession: SparkSession, schema: StructType): Boolean =
+    EtagFileFormats.batchReadAllowed(schema) && super.supportBatch(sparkSession, schema)
+  override def equals(other: Any): Boolean = other != null && other.getClass == getClass
+  override def hashCode(): Int = getClass.hashCode()
+}
+
+class EtagCsvFileFormat extends CSVFileFormat {
+  override def metadataSchemaFields: Seq[StructField] =
+    EtagFileFormats.withCustomFields(super.metadataSchemaFields)
+  override def fileConstantMetadataExtractors: Map[String, PartitionedFile => Any] =
+    EtagFileFormats.METADATA_EXTRACTORS
+  override def equals(other: Any): Boolean = other != null && other.getClass == getClass
+  override def hashCode(): Int = getClass.hashCode()
+}
+
+class EtagJsonFileFormat extends JsonFileFormat {
+  override def metadataSchemaFields: Seq[StructField] =
+    EtagFileFormats.withCustomFields(super.metadataSchemaFields)
+  override def fileConstantMetadataExtractors: Map[String, PartitionedFile => Any] =
+    EtagFileFormats.METADATA_EXTRACTORS
+  override def equals(other: Any): Boolean = other != null && other.getClass == getClass
+  override def hashCode(): Int = getClass.hashCode()
+}
+```
+
+- [ ] **Step 6: Replace `EtagFilePruner.scala`**
+
+`src/main/scala/com/example/spark/etag/EtagFilePruner.scala`:
+```scala
+package com.example.spark.etag
+
+import scala.collection.mutable
+
+import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeReference, BoundReference, Expression, FileSourceConstantMetadataAttribute, GenericInternalRow, Predicate}
+import org.apache.spark.sql.execution.PartitionedFileUtil
+import org.apache.spark.sql.execution.datasources.{FileFormat, PartitionDirectory}
+
+/**
+ * Prunes listed files with data filters that mention the custom metadata columns `etag` and
+ * `user_metadata`.
+ *
+ * Spark's own FilePruningRunner handles filters on file-constant metadata columns, but it builds
+ * the metadata row with FileFormat.createMetadataInternalRow, which only knows the built-in fields
+ * and fails an assertion on any other. So EtagFileIndex keeps `heldBackFilters` away from the
+ * wrapped index and calls `prune` here after the custom values have been attached.
+ *
+ * As in Spark, only filters whose references are all file-constant metadata columns can prune,
+ * and `file_block_start` / `file_block_length` are excluded because splits are not known yet.
+ */
+class EtagFilePruner(dataFilters: Seq[Expression]) {
+
+  /** Every filter that references a custom field. None of these may reach the wrapped FileIndex. */
+  val heldBackFilters: Seq[Expression] = dataFilters.filter(_.references.exists(isCustomField))
+
+  private val prunableFilter: Option[Expression] =
+    heldBackFilters.filter(_.references.forall(isPrunableMetadata)).reduceOption(And)
+
+  /** Metadata column names in the order the bound predicate expects them in the row. */
+  private val requiredColumnNames = mutable.ArrayBuffer.empty[String]
+
+  private val boundPredicate = prunableFilter.map { filter =>
+    Predicate.createInterpreted(filter.transform {
+      case attr: AttributeReference => BoundReference(indexOf(attr.name), attr.dataType, nullable = true)
+    })
+  }
+
+  private def indexOf(columnName: String): Int = {
+    val existing = requiredColumnNames.indexOf(columnName)
+    if (existing >= 0) existing
+    else {
+      requiredColumnNames += columnName
+      requiredColumnNames.length - 1
+    }
+  }
+
+  def prune(directory: PartitionDirectory): PartitionDirectory = boundPredicate match {
+    case None => directory
+    case Some(predicate) =>
+      val kept = directory.files.filter { file =>
+        val partitionedFile =
+          PartitionedFileUtil.getPartitionedFile(file, file.getPath, directory.values, 0L, file.getLen)
+        val row = FileFormat.updateMetadataInternalRow(
+          new GenericInternalRow(requiredColumnNames.length),
+          requiredColumnNames.toSeq,
+          partitionedFile,
+          EtagFileFormats.METADATA_EXTRACTORS)
+        predicate.eval(row)
+      }
+      directory.copy(files = kept)
+  }
+
+  private def isCustomField(attr: Attribute): Boolean = attr match {
+    case FileSourceConstantMetadataAttribute(metadata) =>
+      EtagFileFormats.CUSTOM_FIELD_NAMES.contains(metadata.name)
+    case _ => false
+  }
+
+  private def isPrunableMetadata(attr: Attribute): Boolean = attr match {
+    case FileSourceConstantMetadataAttribute(metadata) =>
+      metadata.name != FileFormat.FILE_BLOCK_START && metadata.name != FileFormat.FILE_BLOCK_LENGTH
+    case _ => false
+  }
+}
+```
+
+- [ ] **Step 7: Run the whole suite**
+
+Run:
+```bash
+sbt test
+```
+Expected: `All tests passed.` with 39 tests (32 before, plus 4 format tests and 3 pruner tests). The end-to-end suite still passes because a `_metadata.user_metadata` field that nothing populates is simply null.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src
+git commit -m "Add user_metadata map field with extractor and pruning support
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 7: Fetch S3 user metadata in `EtagFileIndex`, config switch, end-to-end tests
+
+**Files:**
+- Modify: `src/main/scala/com/example/spark/etag/EtagFileIndex.scala` (replace whole file)
+- Modify: `src/main/scala/com/example/spark/etag/EtagMetadataRule.scala` (new config key, constructor argument)
+- Modify: `src/test/scala/com/example/spark/etag/EtagLocalFileSystem.scala` (add `getXAttrs`, `mtimeSeconds`, `getXAttrsCalls`)
+- Test: `src/test/scala/com/example/spark/etag/EtagFileIndexSuite.scala` (constructor change, new tests)
+- Test: `src/test/scala/com/example/spark/etag/EtagMetadataColumnSuite.scala` (new tests)
+
+**Interfaces:**
+- Consumes: Task 6 (`EtagFileFormats.USER_METADATA_FIELD_NAME`, `USER_METADATA_FIELD`, `EtagFilePruner.heldBackFilters`), Task 4 index, Task 5 rule.
+- Produces:
+  - `class EtagFileIndex(val delegate: FileIndex, hadoopConf: Configuration, fetchUserMetadata: Boolean) extends FileIndex`. After attaching etags it attaches `"user_metadata" -> Map[String, String]` (empty when the object has none) or `null` when fetching is disabled or the filesystem has no xattr support.
+  - `object EtagFileIndex { val UserMetadataThreads: Int = 32; def userMetadataKey(xattrName: String): Option[String] }`.
+  - `EtagMetadataRule.UserMetadataKey: String = "spark.sql.s3etag.userMetadata.enabled"` (default `true`).
+  - Test filesystem: `EtagLocalFileSystem.getXAttrsCalls: AtomicInteger`, `EtagLocalFileSystem.mtimeSeconds(file: File): String` (rclone's format: Unix seconds, a dot, nine fractional digits).
+
+How S3A exposes user metadata (verified against Hadoop branch-3.4 `HeaderProcessing.java`): `getXAttrs(path)` issues one HEAD request and returns every object header as an xattr named `header.<name>` with a UTF-8 encoded value. User metadata comes from the SDK's `metadata()` map, whose keys are already stripped of `x-amz-meta-`, so rclone's `X-Amz-Meta-Mtime` arrives as `header.mtime`. Standard headers use the same prefix with their canonical names (`header.Content-Length`, `header.ETag`, `header.Last-Modified`, `header.x-amz-storage-class`, ...) and must be excluded by name. Keys are compared case-insensitively and `x-amz-meta-` is stripped too, for filesystems that keep it. A filesystem without xattr support throws `UnsupportedOperationException` from `getXAttrs`; that yields null, like a missing ETag.
+
+- [ ] **Step 1: Extend the test filesystem**
+
+In `src/test/scala/com/example/spark/etag/EtagLocalFileSystem.scala`, add the imports `java.nio.charset.StandardCharsets`, `java.time.Instant`, and `java.util.{HashMap => JHashMap, Map => JMap}`, then add inside `class EtagLocalFileSystem`:
+
+```scala
+  /**
+   * Mimics S3A's getXAttrs: every header as "header.<name>". Files carry rclone-style user
+   * metadata `mtime` plus a `name` key that keeps the raw `x-amz-meta-` prefix, except files
+   * whose name starts with "nometa", which carry standard headers only.
+   */
+  override def getXAttrs(path: Path): JMap[String, Array[Byte]] = {
+    EtagLocalFileSystem.getXAttrsCalls.incrementAndGet()
+    val file = pathToFile(path)
+    val headers = new JHashMap[String, Array[Byte]]()
+    def put(name: String, value: String): Unit =
+      headers.put(name, value.getBytes(StandardCharsets.UTF_8))
+    put("header.Content-Length", file.length.toString)
+    put("header.ETag", EtagLocalFileSystem.md5Hex(file))
+    if (file.isFile && !file.getName.startsWith("nometa")) {
+      put("header.mtime", EtagLocalFileSystem.mtimeSeconds(file))
+      put("header.x-amz-meta-name", file.getName)
+    }
+    headers
+  }
+```
+
+and inside `object EtagLocalFileSystem`:
+
+```scala
+  /** Total number of getXAttrs calls across all instances, for cache tests. */
+  val getXAttrsCalls: AtomicInteger = new AtomicInteger(0)
+
+  /** The file's modification time the way rclone stores it: Unix seconds with nine decimals. */
+  def mtimeSeconds(file: File): String = {
+    val instant: Instant = Files.getLastModifiedTime(file.toPath).toInstant
+    f"${instant.getEpochSecond}%d.${instant.getNano}%09d"
+  }
+```
+
+- [ ] **Step 2: Write the failing index tests**
+
+In `src/test/scala/com/example/spark/etag/EtagFileIndexSuite.scala`:
+- add `GetMapValue` to the expressions import;
+- in `Fixture`, add `val noMetadata: File = writeFile(dir1, "nometa.txt", "nnn")` after `b`, include `statusOf(etagfs(noMetadata))` as a third file of the first `PartitionDirectory`, and change the index construction to `val index = new EtagFileIndex(delegate, conf, fetchUserMetadata = true)`;
+- in the existing test "attaches the MD5 etag ...", add `"nometa.txt" -> EtagLocalFileSystem.md5Hex(f.noMetadata)` to the expected map;
+- in the existing test "keeps existing metadata entries on each file", construct the index with `fetchUserMetadata = true` and add `assert(file.metadata.contains(EtagFileFormats.USER_METADATA_FIELD_NAME))`;
+- in the existing test "lists each directory once ...", nothing changes (getXAttrs is a separate counter);
+- add the helpers and tests below.
+
+```scala
+  private def userMetadataOf(directories: Seq[PartitionDirectory]): Map[String, Any] =
+    directories.flatMap(_.files.map(f =>
+      f.getPath.getName -> f.metadata(EtagFileFormats.USER_METADATA_FIELD_NAME))).toMap
+
+  private val userMetadataAttribute = AttributeReference(
+    EtagFileFormats.USER_METADATA_FIELD.name, EtagFileFormats.USER_METADATA_FIELD.dataType,
+    EtagFileFormats.USER_METADATA_FIELD.nullable, EtagFileFormats.USER_METADATA_FIELD.metadata)()
+
+  test("attaches user metadata with header prefixes stripped and standard headers excluded") {
+    val f = new Fixture
+    assert(userMetadataOf(f.index.listFiles(Nil, Nil)) == Map(
+      "a.txt" -> Map("mtime" -> EtagLocalFileSystem.mtimeSeconds(f.a), "name" -> "a.txt"),
+      "b.txt" -> Map("mtime" -> EtagLocalFileSystem.mtimeSeconds(f.b), "name" -> "b.txt"),
+      "nometa.txt" -> Map.empty,
+      "c.txt" -> Map("mtime" -> EtagLocalFileSystem.mtimeSeconds(f.c), "name" -> "c.txt"),
+      "local.txt" -> null))
+  }
+
+  test("fetches user metadata once per file, and again only after refresh") {
+    val f = new Fixture
+    val before = EtagLocalFileSystem.getXAttrsCalls.get()
+    f.index.listFiles(Nil, Nil)
+    assert(EtagLocalFileSystem.getXAttrsCalls.get() == before + 4, "four etagfs files")
+    f.index.listFiles(Nil, Nil)
+    assert(EtagLocalFileSystem.getXAttrsCalls.get() == before + 4, "cached")
+    f.index.refresh()
+    f.index.listFiles(Nil, Nil)
+    assert(EtagLocalFileSystem.getXAttrsCalls.get() == before + 8, "refetched after refresh")
+  }
+
+  test("does not fetch user metadata when disabled, and attaches null instead") {
+    val f = new Fixture
+    val index = new EtagFileIndex(f.delegate, conf, fetchUserMetadata = false)
+    val before = EtagLocalFileSystem.getXAttrsCalls.get()
+    val listed = index.listFiles(Nil, Nil)
+    assert(EtagLocalFileSystem.getXAttrsCalls.get() == before)
+    assert(userMetadataOf(listed).values.forall(_ == null))
+    assert(userMetadataOf(listed).keySet == Set("a.txt", "b.txt", "nometa.txt", "c.txt", "local.txt"))
+  }
+
+  test("applies user_metadata filters itself and keeps them away from the delegate") {
+    val f = new Fixture
+    val filter = EqualTo(GetMapValue(userMetadataAttribute, Literal("name")), Literal("c.txt"))
+    val result = f.index.listFiles(Nil, Seq(filter))
+    assert(f.delegate.lastDataFilters.isEmpty)
+    assert(result.flatMap(_.files).map(_.getPath.getName) == Seq("c.txt"))
+  }
+
+  test("userMetadataKey maps S3A xattr names to user metadata keys") {
+    assert(EtagFileIndex.userMetadataKey("header.mtime") == Some("mtime"))
+    assert(EtagFileIndex.userMetadataKey("header.X-Amz-Meta-Mtime") == Some("mtime"))
+    assert(EtagFileIndex.userMetadataKey("header.Content-Length").isEmpty)
+    assert(EtagFileIndex.userMetadataKey("header.ETag").isEmpty)
+    assert(EtagFileIndex.userMetadataKey("header.x-amz-storage-class").isEmpty)
+    assert(EtagFileIndex.userMetadataKey("user.something").isEmpty)
+  }
+```
+
+- [ ] **Step 3: Write the failing end-to-end tests**
+
+Append inside `class EtagMetadataColumnSuite` in `src/test/scala/com/example/spark/etag/EtagMetadataColumnSuite.scala`:
+
+```scala
+  /** rclone-style mtime of every data file directly under dir, keyed by file name. */
+  private def expectedMtimes(dir: File): Map[String, String] =
+    dir.listFiles.filter(f => f.isFile && f.getName.startsWith("part-"))
+      .map(f => f.getName -> EtagLocalFileSystem.mtimeSeconds(f)).toMap
+
+  private def userMetadataKey(df: DataFrame, key: String): Map[String, String] =
+    df.select(col("_metadata.file_name"), col("_metadata.user_metadata")(key)).distinct()
+      .collect().map(r => r.getString(0) -> r.getString(1)).toMap
+
+  Seq("parquet", "orc").foreach { format =>
+    test(s"$format: _metadata.user_metadata exposes rclone's mtime under the key mtime") {
+      val dir = newDir()
+      writeFiles(format, dir)
+      val df = spark.read.format(format).load(etagfs(dir))
+      assert(userMetadataKey(df, "mtime") == expectedMtimes(dir))
+    }
+  }
+
+  test("a key that is not present in the user metadata yields null") {
+    val dir = newDir()
+    writeFiles("parquet", dir)
+    val df = spark.read.parquet(etagfs(dir))
+    val values = userMetadataKey(df, "missing")
+    assert(values.size == 3)
+    assert(values.values.forall(_ == null))
+  }
+
+  test("an object without user metadata yields a null map, others do not") {
+    val dir = newDir()
+    writeFiles("parquet", dir)
+    val original = dir.listFiles.filter(_.getName.startsWith("part-")).head
+    val renamed = new File(dir, "nometa-" + original.getName)
+    assert(original.renameTo(renamed))
+    val df = spark.read.parquet(etagfs(dir))
+      .select(col("_metadata.file_name").as("name"), col("_metadata.user_metadata").isNull.as("no_metadata"))
+      .distinct()
+    val byName = df.collect().map(r => r.getString(0) -> r.getBoolean(1)).toMap
+    assert(byName(renamed.getName))
+    assert(byName.filterKeys(_ != renamed.getName).values.forall(_ == false))
+  }
+
+  test("a filter on a user_metadata key prunes files before the scan") {
+    val dir = newDir()
+    val expected = writeFiles("parquet", dir)
+    val name = expected.keys.head
+    val filtered = spark.read.parquet(etagfs(dir)).filter(col("_metadata.user_metadata")("name") === name)
+    assert(userMetadataKey(filtered, "name") == Map(name -> name))
+    val scan = filtered.queryExecution.executedPlan.collectFirst { case s: FileSourceScanExec => s }.get
+    filtered.collect()
+    assert(scan.driverMetrics("numFiles").value == 1)
+  }
+
+  test("spark.sql.s3etag.userMetadata.enabled=false skips the per-file requests") {
+    val dir = newDir()
+    writeFiles("parquet", dir)
+    withConf(EtagMetadataRule.UserMetadataKey, "false") {
+      val before = EtagLocalFileSystem.getXAttrsCalls.get()
+      val df = spark.read.parquet(etagfs(dir))
+      assert(metadataFieldNames(df).contains("user_metadata"))
+      assert(userMetadataKey(df, "mtime").values.forall(_ == null))
+      assert(EtagLocalFileSystem.getXAttrsCalls.get() == before)
+    }
+  }
+
+  test("SQL can coalesce keys and turn the mtime into a timestamp") {
+    val dir = newDir()
+    writeFiles("parquet", dir)
+    val rows = spark.sql(
+      s"""SELECT _metadata.file_name AS file_name,
+         |       CAST(timestamp_seconds(CAST(coalesce(_metadata.user_metadata['x-mtime'],
+         |                                            _metadata.user_metadata['mtime']) AS DOUBLE)) AS BIGINT)
+         |         AS modified_seconds
+         |FROM parquet.`${etagfs(dir)}`""".stripMargin).distinct().collect()
+    val actual = rows.map(r => r.getString(0) -> r.getLong(1)).toMap
+    val expected = expectedMtimes(dir).map { case (name, mtime) => name -> mtime.takeWhile(_ != '.').toLong }
+    assert(actual == expected)
+  }
+```
+
+- [ ] **Step 4: Run the tests to verify they fail**
+
+Run:
+```bash
+sbt "testOnly com.example.spark.etag.EtagFileIndexSuite"
+```
+Expected: compilation error, `too many arguments` for `EtagFileIndex` (or `value getXAttrsCalls is not a member`), which shows the new tests are being compiled.
+
+- [ ] **Step 5: Replace `EtagFileIndex.scala`**
+
+`src/main/scala/com/example/spark/etag/EtagFileIndex.scala`:
+```scala
+package com.example.spark.etag
+
+import java.nio.charset.StandardCharsets
+import java.util.{Collections, Locale, Map => JMap}
+import java.util.concurrent.{Callable, ConcurrentHashMap, ExecutionException, Executors}
+
+import scala.jdk.CollectionConverters._
+
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{EtagSource, Path}
+import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.execution.datasources.{FileIndex, FileStatusWithMetadata, PartitionDirectory}
+import org.apache.spark.sql.types.StructType
+
+/**
+ * Wraps any FileIndex and attaches two values to each listed file's metadata map, which is where
+ * Spark reads file-constant `_metadata` fields from:
+ *
+ *  - "etag": the object's ETag, from one Hadoop `listStatus` per directory (one S3 LIST each).
+ *    Spark's own listing drops the ETag (statuses are re-wrapped and serialised), so this index
+ *    lists every directory again, once per directory per index instance.
+ *  - "user_metadata": S3 user-defined metadata, from one `getXAttrs` per file (one S3 HEAD each),
+ *    fetched with a bounded thread pool. Skipped, and attached as null, when `fetchUserMetadata`
+ *    is false.
+ *
+ * Both caches are cleared by `refresh()`. Listing and HEAD failures propagate unchanged, so a
+ * broken directory fails the query the same way it would for Spark's own listing.
+ *
+ * @param delegate the index that does the real work: partition discovery, pruning, caching.
+ * @param hadoopConf configuration used to obtain the FileSystem for each path.
+ * @param fetchUserMetadata whether to issue the per-file requests for user metadata.
+ */
+class EtagFileIndex(
+    val delegate: FileIndex,
+    hadoopConf: Configuration,
+    fetchUserMetadata: Boolean) extends FileIndex {
+
+  private val etagsByDirectory = new ConcurrentHashMap[Path, Map[Path, String]]()
+  private val userMetadataByPath = new ConcurrentHashMap[Path, Map[String, String]]()
+
+  override def rootPaths: Seq[Path] = delegate.rootPaths
+
+  override def listFiles(
+      partitionFilters: Seq[Expression],
+      dataFilters: Seq[Expression]): Seq[PartitionDirectory] = {
+    val pruner = new EtagFilePruner(dataFilters)
+    // The delegate would fail on filters mentioning etag or user_metadata (see EtagFilePruner),
+    // so hold them back.
+    val delegateFilters = dataFilters.filterNot(pruner.heldBackFilters.contains)
+    val listed = delegate.listFiles(partitionFilters, delegateFilters)
+    if (fetchUserMetadata) fetchMissingUserMetadata(listed.flatMap(_.files.map(_.getPath)))
+    listed.map { directory =>
+      pruner.prune(directory.copy(files = directory.files.map(attachValues)))
+    }
+  }
+
+  override def inputFiles: Array[String] = delegate.inputFiles
+
+  override def refresh(): Unit = {
+    etagsByDirectory.clear()
+    userMetadataByPath.clear()
+    delegate.refresh()
+  }
+
+  override def sizeInBytes: Long = delegate.sizeInBytes
+
+  override def partitionSchema: StructType = delegate.partitionSchema
+
+  override def metadataOpsTimeNs: Option[Long] = delegate.metadataOpsTimeNs
+
+  private def attachValues(file: FileStatusWithMetadata): FileStatusWithMetadata = {
+    val path = file.getPath
+    val etag = Option(path.getParent).flatMap(etagsIn(_).get(path)).orNull
+    val userMetadata = if (fetchUserMetadata) userMetadataByPath.get(path) else null
+    file.copy(metadata = file.metadata +
+      (EtagFileFormats.ETAG_FIELD_NAME -> etag) +
+      (EtagFileFormats.USER_METADATA_FIELD_NAME -> userMetadata))
+  }
+
+  private def etagsIn(directory: Path): Map[Path, String] =
+    etagsByDirectory.computeIfAbsent(directory, (d: Path) => listEtags(d))
+
+  private def listEtags(directory: Path): Map[Path, String] = {
+    val fs = directory.getFileSystem(hadoopConf)
+    fs.listStatus(directory).iterator.flatMap { status =>
+      status match {
+        case withEtag: EtagSource if withEtag.getEtag != null => Some(status.getPath -> withEtag.getEtag)
+        case _ => None
+      }
+    }.toMap
+  }
+
+  /** Reads user metadata for every path not cached yet, `UserMetadataThreads` requests at a time. */
+  private def fetchMissingUserMetadata(paths: Seq[Path]): Unit = {
+    val missing = paths.distinct.filterNot(userMetadataByPath.containsKey)
+    if (missing.isEmpty) return
+    val pool = Executors.newFixedThreadPool(EtagFileIndex.UserMetadataThreads, EtagFileIndex.daemonThreads)
+    try {
+      val futures = missing.map { path =>
+        pool.submit(new Callable[Map[String, String]] {
+          override def call(): Map[String, String] = readUserMetadata(path)
+        })
+      }
+      missing.zip(futures).foreach { case (path, future) =>
+        val values =
+          try future.get()
+          catch { case e: ExecutionException => throw e.getCause }
+        if (values != null) userMetadataByPath.put(path, values)
+      }
+    } finally {
+      pool.shutdownNow()
+    }
+  }
+
+  /** The object's user metadata, empty when it has none, null when the filesystem has no xattrs. */
+  private def readUserMetadata(path: Path): Map[String, String] = {
+    val fs = path.getFileSystem(hadoopConf)
+    val attributes: JMap[String, Array[Byte]] =
+      try fs.getXAttrs(path)
+      catch { case _: UnsupportedOperationException => null }
+    if (attributes == null) null
+    else attributes.asScala.iterator.flatMap { case (name, bytes) =>
+      EtagFileIndex.userMetadataKey(name).map(_ -> new String(bytes, StandardCharsets.UTF_8))
+    }.toMap
+  }
+}
+
+object EtagFileIndex {
+  /** Concurrent per-file requests while fetching user metadata on the driver. */
+  val UserMetadataThreads: Int = 32
+
+  /** S3A prefixes every object header it exposes as an xattr with this. */
+  private val HeaderPrefix = "header."
+
+  /** The prefix S3 puts on user metadata on the wire; S3A has usually stripped it already. */
+  private val UserMetadataHeaderPrefix = "x-amz-meta-"
+
+  /**
+   * Standard headers S3A exposes under the same prefix, from HeaderProcessing.XA_STANDARD_HEADERS
+   * in Hadoop 3.4 (lower-cased). Anything else under "header." is user metadata.
+   */
+  private val StandardHeaders: Set[String] = Set(
+    "cache-control", "content-disposition", "content-encoding", "content-language",
+    "content-length", "content-md5", "content-range", "content-type", "etag", "last-modified",
+    "x-amz-archive-status", "x-amz-object-lock-legal-hold", "x-amz-object-lock-mode",
+    "x-amz-object-lock-retain-until-date", "x-amz-replication-status", "x-amz-version-id",
+    "x-amz-server-side-encryption", "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-storage-class").map(HeaderPrefix + _)
+
+  /** The user metadata key an xattr name stands for, or None for anything that is not user metadata. */
+  def userMetadataKey(xattrName: String): Option[String] = {
+    val lower = xattrName.toLowerCase(Locale.ROOT)
+    if (!lower.startsWith(HeaderPrefix) || StandardHeaders.contains(lower)) None
+    else Some(lower.stripPrefix(HeaderPrefix).stripPrefix(UserMetadataHeaderPrefix))
+  }
+
+  private val daemonThreads = new java.util.concurrent.ThreadFactory {
+    private val counter = new java.util.concurrent.atomic.AtomicInteger(0)
+    override def newThread(r: Runnable): Thread = {
+      val thread = new Thread(r, s"etag-user-metadata-${counter.incrementAndGet()}")
+      thread.setDaemon(true)
+      thread
+    }
+  }
+}
+```
+
+If the compiler rejects `return` inside `fetchMissingUserMetadata`, wrap the body in `if (missing.nonEmpty) { ... }` instead. If `Collections` ends up unused, drop it from the import.
+
+- [ ] **Step 6: Update the rule**
+
+In `src/main/scala/com/example/spark/etag/EtagMetadataRule.scala`:
+
+Add to `object EtagMetadataRule`:
+```scala
+  val UserMetadataKey: String = "spark.sql.s3etag.userMetadata.enabled"
+```
+
+Add to the class next to `enabled`:
+```scala
+  private def userMetadataEnabled: Boolean =
+    session.conf.get(EtagMetadataRule.UserMetadataKey, "true").trim.toBoolean
+```
+
+Change the index construction in `rewrite` to:
+```scala
+      location = new EtagFileIndex(
+        fsRelation.location, session.sessionState.newHadoopConf(), userMetadataEnabled),
+```
+
+Update the class comment's last sentence to: `A relation is rewritten when its format is one of Spark's built-in Parquet/ORC/CSV/JSON formats and every root path uses a scheme listed in `spark.sql.s3etag.schemes`; `spark.sql.s3etag.userMetadata.enabled` decides whether the per-file user metadata is fetched.`
+
+- [ ] **Step 7: Run the index suite, then everything**
+
+Run:
+```bash
+sbt "testOnly com.example.spark.etag.EtagFileIndexSuite"
+```
+Expected: 10 tests passed.
+
+Run:
+```bash
+sbt test
+```
+Expected: `All tests passed.` with 56 tests (39 after Task 6, plus 5 index tests, plus 7 end-to-end tests, plus the 5 that were already there... count the suites' own summaries; every suite must report `failed 0`).
+
+If "a filter on a user_metadata key prunes files before the scan" fails on the `numFiles` assertion while the row assertion passes, print `scan.dataFilters` in the test and report the expression shape as DONE_WITH_CONCERNS; do not weaken the assertion.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src
+git commit -m "Fetch S3 user metadata into _metadata.user_metadata
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 8: README, packaged jar, spec sync
 
 **Files:**
 - Create: `README.md`
-- Modify: `docs/superpowers/specs/2026-09-12-s3-etag-metadata-column-design.md` (pruning paragraph and test-filesystem paragraph)
+- Modify: `docs/superpowers/specs/2026-09-12-s3-etag-metadata-column-design.md` (test-filesystem paragraph)
 
 **Interfaces:**
 - Consumes: everything above.
@@ -1228,21 +2036,43 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ````markdown
 # spark-s3-etag
 
-A Spark 4.1 extension that exposes the S3 ETag of every input file as
-`_metadata.etag` on Parquet, ORC, CSV and JSON reads.
+A Spark 4.1 extension that exposes, for every input file of a Parquet, ORC,
+CSV or JSON read, the S3 object's ETag and its user-defined metadata as
+`_metadata.etag` and `_metadata.user_metadata`.
 
 ```sql
-SELECT _metadata.file_path, _metadata.etag, *
+SELECT _metadata.file_path,
+       _metadata.etag,
+       _metadata.user_metadata['mtime'] AS source_mtime,
+       *
 FROM parquet.`s3a://my-bucket/events/`
 ```
 
 ```python
 (spark.read.parquet("s3a://my-bucket/events/")
-      .select("_metadata.file_name", "_metadata.etag", "id"))
+      .select("_metadata.file_name", "_metadata.etag", "_metadata.user_metadata"))
 ```
 
-`WHERE _metadata.etag = '...'` is applied while listing, so non-matching
-files are never opened.
+Filters on either field, such as `WHERE _metadata.etag = '...'` or
+`WHERE _metadata.user_metadata['mtime'] > '1694500000'`, are applied while
+listing, so non-matching files are never opened.
+
+## The rclone `mtime` case
+
+rclone stores the source file's modification time as user metadata
+`X-Amz-Meta-Mtime`, a decimal string of Unix seconds with nanoseconds, for
+example `1694500000.123456789`. S3 user metadata keys arrive without the
+`x-amz-meta-` prefix, so it is under the key `mtime`:
+
+```sql
+SELECT _metadata.file_name,
+       timestamp_seconds(CAST(coalesce(_metadata.user_metadata['mtime'],
+                                       _metadata.user_metadata['x-mtime']) AS DOUBLE)) AS source_modified_at
+FROM parquet.`s3a://my-bucket/events/`
+```
+
+`user_metadata` is `NULL` for an object without user metadata, and a missing
+key yields `NULL`, so `coalesce` across keys works as expected.
 
 ## Requirements
 
@@ -1283,32 +2113,49 @@ spark = (SparkSession.builder
 | Key | Default | Meaning |
 |---|---|---|
 | `spark.sql.s3etag.enabled` | `true` | Turn the rewrite on or off for the session. |
-| `spark.sql.s3etag.schemes` | `s3a` | Comma-separated URI schemes whose reads get the `etag` field. |
+| `spark.sql.s3etag.schemes` | `s3a` | Comma-separated URI schemes whose reads get the new fields. |
+| `spark.sql.s3etag.userMetadata.enabled` | `true` | Fetch `user_metadata`. Costs one HEAD request per file at planning time; when off, the field is always `NULL` and no request is made. |
 
-Both can be changed at runtime with `SET` and take effect for later queries.
+All three can be changed at runtime with `SET` and take effect for later
+queries.
+
+## Cost
+
+* `etag` comes from the directory listing: one S3 LIST request per directory,
+  the same order of cost as Spark's own listing.
+* `user_metadata` needs one S3 HEAD request per file, issued from the driver
+  32 at a time while the query is planned and cached for the life of the
+  plan. For a scan over many thousands of files, turn it off unless you use it.
+* Reading `user_metadata` switches the Parquet and ORC scan to the row-based
+  reader for that query, because Spark's vectorized reader cannot carry a
+  constant map column. Queries that do not select it are unaffected.
 
 ## How it works
 
 1. An analyzer rule rewrites each file relation on an enabled scheme: the file
    index is wrapped, and the file format is swapped for a subclass that adds
-   `etag` to the `_metadata` struct.
+   `etag` and `user_metadata` to the `_metadata` struct.
 2. While Spark lists files for a query, the wrapper issues one `listStatus`
-   per directory and reads the ETag from Hadoop's `EtagSource` statuses. That
-   is one S3 LIST request per directory, cached for the life of the plan.
-3. Filters on `_metadata.etag` are applied by the wrapper during listing.
+   per directory and reads the ETag from Hadoop's `EtagSource` statuses, then
+   one `getXAttrs` per file, which S3A answers with the object's headers.
+   Every `header.*` entry that is not a standard HTTP or `x-amz-*` system
+   header is user metadata.
+3. Filters on `_metadata.etag` and `_metadata.user_metadata` are applied by
+   the wrapper during listing.
 
 ## Checking against a real bucket
 
 ```bash
-aws s3 cp hello.csv s3://my-bucket/check/hello.csv
-aws s3api head-object --bucket my-bucket --key check/hello.csv --query ETag
+aws s3 cp hello.csv s3://my-bucket/check/hello.csv --metadata mtime=1694500000.123456789
+aws s3api head-object --bucket my-bucket --key check/hello.csv --query '[ETag, Metadata]'
 ```
 
 ```python
-spark.read.csv("s3a://my-bucket/check/").select("_metadata.etag").show(truncate=False)
+spark.read.csv("s3a://my-bucket/check/").select("_metadata.etag", "_metadata.user_metadata").show(truncate=False)
 ```
 
-The two values match, minus the surrounding quotes S3 prints.
+The ETag matches minus the surrounding quotes S3 prints, and the map shows
+`{mtime -> 1694500000.123456789}`.
 
 ## Limitations
 
@@ -1318,55 +2165,17 @@ The two values match, minus the surrounding quotes S3 prints.
   route Parquet, ORC, CSV and JSON through V1.
 * Streaming reads are not rewritten.
 * Filesystems whose file statuses do not implement `EtagSource` yield a null
-  `etag` (for example plain `file://`, or vendor S3 clients).
+  `etag`; filesystems without `getXAttrs` support yield a null `user_metadata`
+  (for example plain `file://`, or vendor S3 clients).
 * Wrapping the file index hides its concrete class from Spark's
   `PruneFileSourcePartitions` optimizer rule. Partition pruning still happens
   during listing, but optimizer statistics for partitioned catalog tables can
   be less precise.
 ````
 
-- [ ] **Step 2: Sync the spec with what was learned during planning**
+- [ ] **Step 2: Confirm the spec matches the code**
 
-In `docs/superpowers/specs/2026-09-12-s3-etag-metadata-column-design.md`:
-
-Replace the bullet
-```
-* `FilePruningRunner` evaluates filters on constant metadata fields at
-  planning time, so files can be pruned by ETag.
-```
-with
-```
-* `FilePruningRunner` evaluates filters on constant metadata fields at
-  planning time, but it builds the metadata row with
-  `FileFormat.createMetadataInternalRow`, which asserts that every field is
-  one of the built-in four. A filter on `etag` therefore must not reach the
-  wrapped index; `EtagFileIndex` strips such filters and applies them itself
-  through `EtagFilePruner` after attaching the etags.
-```
-
-Replace the sentence in the `EtagLocalFileSystem` paragraph
-```
-Its `listStatus`,
-`getFileStatus` and `listLocatedStatus` wrap each file status in a subclass
-```
-with
-```
-Its `listStatus` and
-`getFileStatus` wrap each file status in a subclass
-```
-
-Add to the `## Components` section, after `EtagFileIndex`:
-```
-### `EtagFilePruner(dataFilters: Seq[Expression])`
-
-Exposes `etagFilters`, the input filters that reference the `etag` metadata
-attribute, and `prune(directory)`, which drops files failing those filters
-whose references are all file-constant metadata attributes other than
-`file_block_start` and `file_block_length`. Binding and evaluation mirror
-Spark's `FilePruningRunner`, but the metadata row is built with
-`FileFormat.updateMetadataInternalRow` over a `PartitionedFile`, which
-supports custom constant fields.
-```
+Read `docs/superpowers/specs/2026-09-12-s3-etag-metadata-column-design.md` sections `## Components` and `## Configuration keys` and confirm the constructor `EtagFileIndex(delegate, hadoopConf, fetchUserMetadata)`, the field `heldBackFilters`, the config key `spark.sql.s3etag.userMetadata.enabled` and the `supportBatch` override are described as implemented. Fix any sentence that disagrees with the code; no change is expected.
 
 - [ ] **Step 3: Build the jar and check its contents**
 
@@ -1380,7 +2189,7 @@ Run:
 ```bash
 unzip -l target/scala-2.13/spark-s3-etag_2.13-0.1.0.jar | grep -c "com/example/spark/etag/"
 ```
-Expected: a count of at least 8 class entries and no entries from other packages (e.g. no `org/apache/`).
+Expected: a count of at least 10 class entries and no entries from other packages (e.g. no `org/apache/`).
 
 - [ ] **Step 4: Run the full suite one last time**
 
@@ -1394,7 +2203,7 @@ Expected: `All tests passed.`
 
 ```bash
 git add README.md docs
-git commit -m "Add README and sync spec with pruning design
+git commit -m "Add README and sync spec
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 ```
